@@ -600,8 +600,8 @@ with st.sidebar:
 
     # ── 익절 설정 ────────────────────────────────────────────
     st.subheader("💹 익절 설정")
-    profit1_options = [15, 20, 25]
-    profit2_options = [20, 25, 30]
+    profit1_options = [15, 20, 25, 30, 35, 40, 45, 50]
+    profit2_options = [20, 25, 30, 35, 40, 45, 50, 55, 60]
 
     p["profit1_pct"] = st.selectbox(
         "1차 익절 비율 (%)",
