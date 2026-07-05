@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 # 코드 업데이트 시 Streamlit 세션 초기화용 (값 변경 시 자동 리셋)
-APP_VERSION = "20260705-v11"
+APP_VERSION = "20260705-v12"
 
 # .env 파일 로딩
 load_dotenv()

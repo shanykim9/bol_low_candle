@@ -64,6 +64,8 @@ def init_session():
         "input_method"  : "직접 입력",
         "uploaded_names_raw": None,
         "uploaded_file_name": "",
+        "uploaded_names_key": None,   # parse_stock_list 결과 캐시 키
+        "upload_failed_names": [],    # 마지막 변환 실패 종목명
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -122,25 +124,48 @@ def resolve_names_to_codes(api: KiwoomAPI, names: list[str]) -> tuple[dict, list
     return success, failed
 
 
-def _prepare_tickers_for_sim() -> tuple[dict[str, str], list[str]]:
+def _names_cache_key(names: list[str]) -> tuple[str, ...]:
+    """업로드 종목 목록 비교용 키 (parse_stock_list 결과 그대로)"""
+    return tuple(names)
+
+
+def _uploaded_names_cached() -> bool:
+    """파일 업로드 모드에서 종목명→코드 변환이 이미 완료되었는지"""
+    if st.session_state.get("input_method") != "파일 업로드":
+        return False
+    raw = st.session_state.get("uploaded_names_raw")
+    if not raw or not st.session_state.get("ticker_map"):
+        return False
+    names = parse_stock_list(raw)
+    return _names_cache_key(names) == st.session_state.get("uploaded_names_key")
+
+
+def _prepare_tickers_for_sim() -> tuple[dict[str, str], list[str], bool]:
     """
     시뮬레이션 실행 직전 종목 목록 준비.
-    파일 업로드 모드: 업로드 텍스트 → 종목코드 자동 변환
+    파일 업로드 모드: 업로드 텍스트 → 종목코드 자동 변환 (동일 목록이면 캐시 재사용)
     직접 입력 모드: session ticker_map 사용
+    반환: (ticker_map, failed_names, from_cache)
     """
     method = st.session_state.get("input_method", "직접 입력")
     if method == "파일 업로드":
         raw = st.session_state.get("uploaded_names_raw")
         if not raw:
-            return {}, []
+            return {}, [], False
         names = parse_stock_list(raw)
         if not names:
-            return {}, []
+            return {}, [], False
+        cache_key = _names_cache_key(names)
+        cached = st.session_state.get("ticker_map", {})
+        if cache_key == st.session_state.get("uploaded_names_key") and cached:
+            return dict(cached), list(st.session_state.get("upload_failed_names", [])), True
         api = KiwoomAPI()
         success, failed = resolve_names_to_codes(api, names)
         st.session_state.ticker_map = success
-        return success, failed
-    return dict(st.session_state.get("ticker_map", {})), []
+        st.session_state.uploaded_names_key = cache_key
+        st.session_state.upload_failed_names = failed
+        return success, failed, False
+    return dict(st.session_state.get("ticker_map", {})), [], False
 
 
 def _sim_ready() -> bool:
@@ -489,8 +514,8 @@ with st.sidebar:
 
     else:  # 파일 업로드
         uploaded = st.file_uploader(
-            "종목명 텍스트 파일 (.txt)\n한 줄에 1개, 또는 쉼표/줄바꿈으로 구분",
-            type=["txt"],
+            "종목명 파일 (.txt / .md)\n한 줄에 1개, 또는 쉼표/줄바꿈으로 구분",
+            type=["txt", "md"],
         )
         if uploaded is not None:
             raw = uploaded.read().decode("utf-8", errors="ignore")
@@ -498,17 +523,26 @@ with st.sidebar:
                 st.session_state.uploaded_names_raw = raw
                 st.session_state.uploaded_file_name = uploaded.name
                 st.session_state.ticker_map = {}
+                st.session_state.uploaded_names_key = None
+                st.session_state.upload_failed_names = []
                 st.session_state.sim_result = None
             n = len(parse_stock_list(raw))
-            st.caption(
-                f"📄 {uploaded.name} · {n}개 종목 "
-                f"(시뮬레이션 실행 시 자동 변환)"
+            convert_hint = (
+                "변환 완료 · 재실행 시 생략"
+                if _uploaded_names_cached()
+                else "시뮬레이션 실행 시 자동 변환"
             )
+            st.caption(f"📄 {uploaded.name} · {n}개 종목 ({convert_hint})")
         elif st.session_state.get("uploaded_names_raw"):
             n = len(parse_stock_list(st.session_state.uploaded_names_raw))
+            convert_hint = (
+                "변환 완료 · 재실행 시 생략"
+                if _uploaded_names_cached()
+                else "시뮬레이션 실행 시 자동 변환"
+            )
             st.caption(
                 f"📄 {st.session_state.get('uploaded_file_name', '업로드됨')} "
-                f"· {n}개 종목 (시뮬레이션 실행 시 자동 변환)"
+                f"· {n}개 종목 ({convert_hint})"
             )
 
     # 현재 종목 목록 표시
@@ -717,20 +751,20 @@ else:
     if not _sim_ready():
         st.info(
             "사이드바에서 종목을 입력(직접 입력 → 종목 확인)하거나 "
-            "txt 파일을 업로드한 뒤 **▶ 시뮬레이션 실행**을 클릭하세요."
+            "txt/md 파일을 업로드한 뒤 **▶ 시뮬레이션 실행**을 클릭하세요."
         )
     else:
-        pending_n = (
-            len(parse_stock_list(st.session_state.uploaded_names_raw))
-            if st.session_state.get("input_method") == "파일 업로드"
-            and st.session_state.get("uploaded_names_raw")
-            and not st.session_state.ticker_map
-            else len(st.session_state.ticker_map)
-        )
-        label = f"**{pending_n}개** 종목 (실행 시 변환)" if (
+        if (
             st.session_state.get("input_method") == "파일 업로드"
-            and not st.session_state.ticker_map
-        ) else f"**{len(st.session_state.ticker_map)}개** 종목"
+            and st.session_state.get("uploaded_names_raw")
+        ):
+            pending_n = len(parse_stock_list(st.session_state.uploaded_names_raw))
+            if _uploaded_names_cached():
+                label = f"**{len(st.session_state.ticker_map)}개** 종목 (변환 완료)"
+            else:
+                label = f"**{pending_n}개** 종목 (실행 시 변환)"
+        else:
+            label = f"**{len(st.session_state.ticker_map)}개** 종목"
         st.write(f"분석 대상: {label}")
         st.caption(
             f"시뮬레이션 조건: 탐색 {format_scan_months(p['scan_months'])} "
@@ -748,12 +782,15 @@ else:
         if st.button("▶ 시뮬레이션 실행", type="primary"):
             st.session_state.sim_result = None
 
-            # ── 종목코드 변환 (파일 업로드 시 자동) ──────────
-            if st.session_state.get("input_method") == "파일 업로드":
+            # ── 종목코드 변환 (파일 업로드 시, 동일 목록이면 캐시 재사용) ──
+            if (
+                st.session_state.get("input_method") == "파일 업로드"
+                and not _uploaded_names_cached()
+            ):
                 with st.spinner("종목코드 변환 중..."):
-                    ticker_map, failed = _prepare_tickers_for_sim()
+                    ticker_map, failed, from_cache = _prepare_tickers_for_sim()
             else:
-                ticker_map, failed = _prepare_tickers_for_sim()
+                ticker_map, failed, from_cache = _prepare_tickers_for_sim()
 
             if failed:
                 st.warning(f"⚠️ 매핑 실패 {len(failed)}개: {', '.join(failed)}")
@@ -761,13 +798,16 @@ else:
                 st.error("변환된 종목이 없습니다. 파일 또는 입력을 확인해주세요.")
                 st.stop()
 
-            if (
-                st.session_state.get("input_method") == "파일 업로드"
-                and ticker_map
-            ):
-                st.success(
-                    f"✅ {len(ticker_map)}개 종목 변환 완료 → 시뮬레이션 시작"
-                )
+            if st.session_state.get("input_method") == "파일 업로드" and ticker_map:
+                if from_cache:
+                    st.info(
+                        f"⚡ {len(ticker_map)}개 종목 — 기존 변환 결과 사용 "
+                        f"(종목명 변환 생략)"
+                    )
+                else:
+                    st.success(
+                        f"✅ {len(ticker_map)}개 종목 변환 완료 → 시뮬레이션 시작"
+                    )
 
             api   = KiwoomAPI()
             sim   = Simulator(api, dict(p))
