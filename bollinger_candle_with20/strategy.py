@@ -19,61 +19,6 @@ from config import resolve_scan_days, resolve_scan_range
 logger = logging.getLogger(__name__)
 
 
-def _ymd(val) -> str:
-    return str(val).replace("-", "").replace(".", "")[:8]
-
-
-def demand_filter_enabled(params: dict) -> bool:
-    return (
-        int(params.get("foreigner_days") or 0) > 0
-        or int(params.get("institution_days") or 0) > 0
-    )
-
-
-def check_buy_turn(net_by_date: dict, asof, days: int) -> bool:
-    """
-    기준일(asof)까지 시계열에서
-      직전일 순매도(<0) + 이후 days일 연속 순매수(>0)
-    마지막 순매수일이 기준일과 같아야 한다.
-    days<=0 이면 항상 True. 순매수 0은 매수/매도 모두 아님.
-    """
-    n = int(days or 0)
-    if n <= 0:
-        return True
-    asof_s = _ymd(asof)
-    if len(asof_s) != 8 or not net_by_date:
-        return False
-    rows = []
-    for dt, val in net_by_date.items():
-        d = _ymd(dt)
-        if len(d) == 8 and d <= asof_s:
-            rows.append((d, int(val)))
-    rows.sort()
-    if len(rows) < n + 1:
-        return False
-    if rows[-1][0] != asof_s:
-        return False
-    window = rows[-(n + 1):]
-    if window[0][1] >= 0:
-        return False
-    return all(v > 0 for _, v in window[1:])
-
-
-def investor_filter_ok(params: dict, investor_flow: Optional[dict], asof) -> bool:
-    """외국인/기관 수급 조건을 AND. 둘 다 0이면 통과."""
-    if not demand_filter_enabled(params):
-        return True
-    if not investor_flow:
-        return False
-    fdays = int(params.get("foreigner_days") or 0)
-    idays = int(params.get("institution_days") or 0)
-    if fdays > 0 and not check_buy_turn(investor_flow.get("foreigner") or {}, asof, fdays):
-        return False
-    if idays > 0 and not check_buy_turn(investor_flow.get("institution") or {}, asof, idays):
-        return False
-    return True
-
-
 def _to_date(val) -> Optional[pd.Timestamp]:
     """캔들 date(YYYYMMDD 등) → Timestamp. 실패 시 None."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -113,6 +58,9 @@ def calc_indicators(candles: list[dict], ma_period: int = 240,
 
     # 이동평균선
     df["ma"] = df["close"].rolling(window=ma_period, min_periods=ma_period).mean()
+
+    # 종가 SMA20 (기준캔들 하락 필터용, 볼린저 기간과 독립)
+    df["ma20"] = df["close"].rolling(window=20, min_periods=20).mean()
 
     # 볼린저밴드 (영웅문4: SMA ± D1 × 모집단표준편차, ddof=0)
     df["bb_mid"]   = df["close"].rolling(window=bb_period, min_periods=bb_period).mean()
@@ -214,12 +162,36 @@ def find_pivot_candle(df: pd.DataFrame, scan_days: int = 126,
 
 
 # ── 기준캔들 판단 ─────────────────────────────────────────────
-def check_base_candle(df: pd.DataFrame, pivot: dict) -> Optional[dict]:
+def is_ma20_declining(df: pd.DataFrame, idx: int) -> bool:
+    """
+    당일 SMA20 < 전날 SMA20 이면 True (하락).
+    값이 없거나 같으면 False (통과).
+    """
+    if idx < 1 or "ma20" not in df.columns:
+        return False
+    cur  = df.loc[idx, "ma20"]
+    prev = df.loc[idx - 1, "ma20"]
+    if pd.isna(cur) or pd.isna(prev):
+        return False
+    return float(cur) < float(prev)
+
+
+def _passes_base_ma20_filter(df: pd.DataFrame, idx: int,
+                             params: Optional[dict]) -> bool:
+    """20일선 하락반영 ON이면 하락 시 False, OFF/미설정이면 True."""
+    if not params or not params.get("ma20_decline_filter", False):
+        return True
+    return not is_ma20_declining(df, idx)
+
+
+def check_base_candle(df: pd.DataFrame, pivot: dict,
+                      params: Optional[dict] = None) -> Optional[dict]:
     """
     저점캔들 바로 다음 거래일의 캔들이 기준캔들 조건을 만족하는지 확인
     조건:
       A) 종가 > 시가 (양봉)
       B) 종가 > 저점캔들의 고가 (같으면 탈락)
+      C) (옵션) 20일선이 전일 대비 하락이면 제외
     """
     pivot_idx = pivot["idx"]
     next_idx  = pivot_idx + 1
@@ -232,18 +204,20 @@ def check_base_candle(df: pd.DataFrame, pivot: dict) -> Optional[dict]:
     row = df.loc[next_idx]
     is_bullish = row["close"] > row["open"]
     meets_high = row["close"] > pivot["high"]
+    if not (is_bullish and meets_high):
+        return None
+    if not _passes_base_ma20_filter(df, next_idx, params):
+        return None
 
-    if is_bullish and meets_high:
-        return {
-            "date"  : row["date"],
-            "open"  : int(row["open"]),
-            "high"  : int(row["high"]),
-            "low"   : int(row["low"]),
-            "close" : int(row["close"]),
-            "volume": int(row["volume"]),
-            "idx"   : next_idx,
-        }
-    return None
+    return {
+        "date"  : row["date"],
+        "open"  : int(row["open"]),
+        "high"  : int(row["high"]),
+        "low"   : int(row["low"]),
+        "close" : int(row["close"]),
+        "volume": int(row["volume"]),
+        "idx"   : next_idx,
+    }
 
 
 # ── 매수가 계산 ───────────────────────────────────────────────
@@ -352,8 +326,7 @@ class SignalChecker:
 
 
 # ── 시뮬레이션용 단일 종목 전략 실행 ─────────────────────────
-def simulate_strategy(candles: list[dict], params: dict,
-                      investor_flow: Optional[dict] = None) -> list[dict]:
+def simulate_strategy(candles: list[dict], params: dict) -> list[dict]:
     """
     과거 일봉 데이터 전체를 순회하며 매매 시그널 시뮬레이션
     반환: 각 트레이드 결과 리스트
@@ -398,12 +371,8 @@ def simulate_strategy(candles: list[dict], params: dict,
             i += 1
             continue
 
-        base = _check_base_in_window(window_df, pivot)
+        base = _check_base_in_window(window_df, pivot, params)
         if base is None:
-            i += 1
-            continue
-
-        if not investor_filter_ok(params, investor_flow, base["date"]):
             i += 1
             continue
 
@@ -464,17 +433,20 @@ def _find_pivot_in_window(df: pd.DataFrame, scan_days: int,
     return None
 
 
-def _check_base_in_window(df: pd.DataFrame, pivot: dict) -> Optional[dict]:
+def _check_base_in_window(df: pd.DataFrame, pivot: dict,
+                          params: Optional[dict] = None) -> Optional[dict]:
     next_idx = pivot["idx"] + 1
     if next_idx not in df.index or next_idx != df.index[-1]:
         return None
     row = df.loc[next_idx]
-    if row["close"] > row["open"] and row["close"] > pivot["high"]:
-        return {"date": row["date"], "open": int(row["open"]),
-                "high": int(row["high"]), "low": int(row["low"]),
-                "close": int(row["close"]), "volume": int(row["volume"]),
-                "idx": next_idx}
-    return None
+    if not (row["close"] > row["open"] and row["close"] > pivot["high"]):
+        return None
+    if not _passes_base_ma20_filter(df, next_idx, params):
+        return None
+    return {"date": row["date"], "open": int(row["open"]),
+            "high": int(row["high"]), "low": int(row["low"]),
+            "close": int(row["close"]), "volume": int(row["volume"]),
+            "idx": next_idx}
 
 
 def _run_trade_simulation(df: pd.DataFrame, start_idx: int,

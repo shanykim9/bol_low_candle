@@ -1,13 +1,17 @@
 """
-bollinger_candle_auto_trade.py
-볼린저밴드 + 저점캔들 돌파 양봉 자동매매 시스템
-Streamlit UI
+bol_lowcandle_demand.py
+볼린저밴드 + 저점캔들 돌파 양봉 + 외국인/기관 수급 필터
+Streamlit UI  (원본: bollinger_candle_auto_trade.py)
+
+실행:
+  streamlit run bol_lowcandle_demand.py
 """
 
 import io
 import time
 import logging
 import threading
+import html as html_lib
 from datetime import date, datetime
 
 import pandas as pd
@@ -15,7 +19,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 import config
-from config import validate_env, calc_budgets, DEFAULT_PARAMS, APP_VERSION
+from config import validate_env, calc_budgets, DEFAULT_PARAMS
 from config import (
     resolve_scan_days, resolve_data_days,
     scan_month_options, format_scan_months, calc_data_days,
@@ -30,9 +34,13 @@ from kiwoom_api import KiwoomAPI
 from state_manager import StateManager, IDLE, WAIT_BUY, PARTIALLY_BOUGHT, FULLY_BOUGHT, TAKING_PROFIT
 from strategy import (
     calc_indicators, find_pivot_candle, check_base_candle,
-    calc_buy_prices, calc_stop_price, SignalChecker
+    calc_buy_prices, calc_stop_price, SignalChecker,
+    investor_filter_ok, demand_filter_enabled,
 )
-from simulator import Simulator, summarize_by_stock, analyze_portfolio_capital, detail_trades_df
+from simulator import (
+    Simulator, MarketDataCache, summarize_by_stock,
+    analyze_portfolio_capital, detail_trades_df,
+)
 
 # ── 로깅 설정 ────────────────────────────────────────────────
 logging.basicConfig(
@@ -41,9 +49,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+APP_VERSION = "20260820-demand-v4"
+
+DEMAND_DAY_OPTS = [0, 1, 2, 3]
+
 # ── 페이지 설정 ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="볼린저밴드 자동매매",
+    page_title="볼린저밴드 자동매매 (수급)",
     page_icon="📈",
     layout="wide",
 )
@@ -69,6 +81,10 @@ def init_session():
         "uploaded_file_name": "",
         "uploaded_names_key": None,   # parse_stock_list 결과 캐시 키
         "upload_failed_names": [],    # 마지막 변환 실패 종목명
+        "market_data_cache": None,    # 사용 안 함 (market_cache_data dict 사용)
+        "market_cache_data": {"candles": {}, "investor": {}},
+        "sim_fingerprint": None,      # 마지막 실행 조건
+        "sim_settings_snap": None,    # 결과 상단 입력조건 배너
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -90,6 +106,74 @@ def init_session():
     p["data_days"] = calc_data_days_from_params(p)
 
 init_session()
+
+
+def format_demand_days(days: int) -> str:
+    if int(days or 0) <= 0:
+        return "미사용"
+    return f"{int(days)}일 연속 순매수 (직전일 순매도→전환)"
+
+
+def _demand_short(days) -> str:
+    d = int(days or 0)
+    return "미사용" if d <= 0 else f"{d}일"
+
+
+def _stop_short(params: dict) -> str:
+    if params.get("stop_mode") == "기준저가":
+        return "기준저가"
+    return f"1차매수가대비 -{int(params.get('stop_pct', 10))}%"
+
+
+def build_sim_settings_snap(params: dict, n_stocks: int, stats: dict | None = None) -> dict:
+    stats = stats or {}
+    return {
+        "period": format_scan_period(params),
+        "source": format_price_source(params.get("price_source", "KRX")),
+        "foreigner": _demand_short(params.get("foreigner_days")),
+        "institution": _demand_short(params.get("institution_days")),
+        "profit": (
+            f"{int(params.get('profit1_pct', 0))}% / "
+            f"{int(params.get('profit2_pct', 0))}%"
+        ),
+        "stop": _stop_short(params),
+        "budget": f"{int(params.get('total_budget', 0)):,}원",
+        "ma": format_ma_filter(params),
+        "n_stocks": int(n_stocks or 0),
+        "api": int(stats.get("candle_miss") or 0),
+        "cache": int(stats.get("candle_hit") or 0),
+    }
+
+
+def _render_settings_banner(snap: dict | None):
+    """분석 결과 상단 — 이번 실행에 사용한 입력 조건"""
+    if not snap:
+        return
+
+    def _e(v) -> str:
+        return html_lib.escape(str(v))
+
+    parts = [
+        f"<b>기간</b> {_e(snap.get('period', '-'))}",
+        f"<b>시세</b> {_e(snap.get('source', '-'))}",
+        f"<b>외국인</b> {_e(snap.get('foreigner', '-'))}",
+        f"<b>기관</b> {_e(snap.get('institution', '-'))}",
+        f"<b>1·2차 익절</b> {_e(snap.get('profit', '-'))}",
+        f"<b>손절</b> {_e(snap.get('stop', '-'))}",
+        f"<b>매수</b> {_e(snap.get('budget', '-'))}",
+        f"<b>240선</b> {_e(snap.get('ma', '-'))}",
+        f"<b>종목</b> {_e(snap.get('n_stocks', 0))}개",
+        f"<b>API</b> {_e(snap.get('api', 0))}",
+        f"<b>캐시</b> {_e(snap.get('cache', 0))}",
+    ]
+    st.markdown(
+        "<div style='background:#e8eef4;border:1px solid #d5dee8;border-radius:8px;"
+        "padding:10px 14px;font-size:0.93rem;color:#2c3a4a;line-height:1.55;"
+        "margin:0 0 12px 0;'>"
+        + " · ".join(parts)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ── 로그 기록 ─────────────────────────────────────────────────
@@ -186,6 +270,23 @@ def _sim_ready() -> bool:
     return bool(st.session_state.get("ticker_map"))
 
 
+def _sim_input_fingerprint(params: dict) -> tuple:
+    """사이드바 조건 + 종목 목록 변경 감지용"""
+    keys = (
+        "price_source", "scan_mode", "scan_months", "scan_start", "scan_end",
+        "data_days", "ma_period", "bb_period", "bb_multiplier",
+        "ma_filter_mode", "ma_trend_days", "total_budget",
+        "stop_mode", "stop_pct", "profit1_pct", "profit2_pct", "trailing_pct",
+        "foreigner_days", "institution_days", "abandon_pct", "volume_ratio",
+    )
+    method = st.session_state.get("input_method", "직접 입력")
+    if method == "파일 업로드":
+        tickers = parse_stock_list(st.session_state.get("uploaded_names_raw") or "")
+    else:
+        tickers = sorted(st.session_state.get("ticker_map") or {})
+    return (method, tuple(tickers), tuple((k, params.get(k)) for k in keys))
+
+
 # ── 매매 엔진 (별도 스레드) ───────────────────────────────────
 def trading_worker(api: KiwoomAPI, sm: StateManager, params: dict):
     """장중 폴링 루프. running 플래그가 False가 되면 종료."""
@@ -240,6 +341,11 @@ def _process_ticker(api: KiwoomAPI, sm: StateManager,
         base = check_base_candle(df, pivot)
         if not base:
             return
+
+        if demand_filter_enabled(params):
+            flow = api.get_investor_flow(code, count=30)
+            if not investor_filter_ok(params, flow, base["date"]):
+                return
 
         prices     = calc_buy_prices(pivot, base, params["volume_ratio"])
         stop_price = calc_stop_price(pivot, base, params["stop_mode"],
@@ -429,6 +535,21 @@ def _render_sim_results(df_sim: pd.DataFrame, done: int, total: int,
         with st.expander("📋 거래 상세 보기", expanded=False):
             detail = detail_trades_df(df_sim)
             st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
+def _paint_sim_panel(slot, df_sim, done: int, total: int, running: bool,
+                     settings_snap: dict | None = None,
+                     show_downloads: bool = False):
+    """같은 자리의 결과 패널을 지우고 다시 그린다 (진행 중 업데이트용)."""
+    snap = settings_snap or st.session_state.get("sim_settings_snap")
+    slot.empty()
+    with slot.container():
+        st.subheader("📊 시뮬레이션 결과")
+        _render_settings_banner(snap)
+        _render_sim_results(df_sim, done, total, running=running)
+        # 다운로드는 최종 1회만 (진행 콜백과 중복 키 방지)
+        if show_downloads and df_sim is not None and not df_sim.empty:
+            _sim_export_downloads(df_sim, key="sim_csv_download")
 
 
 def _sim_export_downloads(df_sim: pd.DataFrame, key: str):
@@ -765,6 +886,33 @@ with st.sidebar:
     st.caption(f"트레일링 스탑: 익절가 대비 -{p['trailing_pct']}% 하락 시 잔량 전량 매도")
     st.divider()
 
+    # ── 외국인/기관 수급 ──────────────────────────────────────
+    st.subheader("🏦 수급 조건 (AND)")
+    if p.get("foreigner_days") not in DEMAND_DAY_OPTS:
+        p["foreigner_days"] = 0
+    if p.get("institution_days") not in DEMAND_DAY_OPTS:
+        p["institution_days"] = 0
+    p["foreigner_days"] = st.selectbox(
+        "외국인 수급",
+        DEMAND_DAY_OPTS,
+        index=DEMAND_DAY_OPTS.index(int(p["foreigner_days"])),
+        format_func=lambda d: "0일 (미사용)" if d == 0 else f"{d}일 연속 순매수",
+        help="0=수급 미사용. N일=직전일 순매도 후 N일 연속 순매수(마지막 날이 기준캔들일).",
+    )
+    p["institution_days"] = st.selectbox(
+        "기관수급",
+        DEMAND_DAY_OPTS,
+        index=DEMAND_DAY_OPTS.index(int(p["institution_days"])),
+        format_func=lambda d: "0일 (미사용)" if d == 0 else f"{d}일 연속 순매수",
+        help="0=수급 미사용. N일=직전일 순매도 후 N일 연속 순매수(마지막 날이 기준캔들일).",
+    )
+    st.caption(
+        f"외국인 {format_demand_days(p['foreigner_days'])} · "
+        f"기관 {format_demand_days(p['institution_days'])} · "
+        "기존 저점/기준캔들 조건과 AND"
+    )
+    st.divider()
+
     # ── 자동매매 제어 ────────────────────────────────────────
     if mode == "실시간 자동매매":
         col1, col2 = st.columns(2)
@@ -797,7 +945,7 @@ with st.sidebar:
 
 
 # ── 메인 화면 ────────────────────────────────────────────────
-st.title("📈 볼린저밴드 + 저점캔들 돌파 양봉 자동매매")
+st.title("📈 볼린저밴드 + 저점캔들 + 수급 필터")
 
 if missing_env:
     st.error(
@@ -876,7 +1024,10 @@ else:
         st.caption(
             f"시뮬레이션 조건: 탐색 {format_scan_period(p)} "
             f"({resolve_scan_days(p):,}거래일), 일봉 수집 {resolve_data_days(p):,}일 · "
-            f"{format_ma_filter(p)}"
+            f"{format_ma_filter(p)} · "
+            f"외국인 {format_demand_days(p.get('foreigner_days', 0))} · "
+            f"기관 {format_demand_days(p.get('institution_days', 0))} · "
+            "같은 종목 재실행 시 일봉·수급은 캐시 사용"
         )
         ticker_list_str = ", ".join(
             [f"{n}({c})" for c, n in st.session_state.ticker_map.items()]
@@ -884,9 +1035,25 @@ else:
         if ticker_list_str:
             st.caption(ticker_list_str)
 
-        sim_panel = st.empty()
+        fp_now = _sim_input_fingerprint(p)
+        fp_last = st.session_state.get("sim_fingerprint")
+        settings_changed = fp_last is None or fp_now != fp_last
+        can_run = settings_changed
 
-        if st.button("▶ 시뮬레이션 실행", type="primary"):
+        run_clicked = st.button(
+            "▶ 시뮬레이션 실행",
+            type="primary",
+            disabled=not can_run,
+            key="btn_sim_run",
+        )
+        if fp_last is not None and not settings_changed:
+            st.caption("이전 실행과 조건이 같습니다. 사이드바에서 설정을 바꾸면 다시 실행할 수 있습니다.")
+        elif fp_last is not None and settings_changed:
+            st.caption("설정이 변경되었습니다. 실행을 누르면 캐시된 데이터로 다시 분석합니다.")
+
+        results_slot = st.empty()
+
+        if run_clicked and can_run:
             st.session_state.sim_result = None
 
             # ── 종목코드 변환 (파일 업로드 시, 동일 목록이면 캐시 재사용) ──
@@ -916,8 +1083,28 @@ else:
                         f"✅ {len(ticker_map)}개 종목 변환 완료 → 시뮬레이션 시작"
                     )
 
-            api   = KiwoomAPI()
-            sim   = Simulator(api, dict(p))
+            store = st.session_state.get("market_cache_data")
+            if not isinstance(store, dict):
+                store = {"candles": {}, "investor": {}}
+                st.session_state.market_cache_data = store
+            cache = MarketDataCache(store)
+            cache.reset_stats()
+
+            needed = resolve_data_days(p)
+            src = p.get("price_source", "KRX")
+            flow_n = max(needed + 20, 120) if demand_filter_enabled(p) else 0
+            cache_ready = cache.covers(ticker_map, needed, src, flow_count=flow_n)
+
+            api = None
+            if not cache_ready:
+                api = KiwoomAPI()
+                st.caption("일봉·수급을 REST에서 가져와 세션에 저장합니다.")
+            else:
+                st.info(
+                    f"⚡ {len(ticker_map)}개 종목 일봉·수급 캐시 사용 (REST 생략)"
+                )
+
+            sim = Simulator(api, dict(p), data_cache=cache)
             total = len(ticker_map)
 
             progress_bar = st.progress(0, text=f"0/{total} 종목")
@@ -927,13 +1114,17 @@ else:
                 pct = done / total_cnt if total_cnt > 0 else 0
                 progress_bar.progress(pct, text=f"{done}/{total_cnt} 종목")
                 status_text.caption(msg)
-                if partial_df is not None:
-                    with sim_panel.container():
-                        st.subheader("📊 시뮬레이션 결과")
-                        _render_sim_results(
-                            partial_df, done, total_cnt,
-                            running=(done < total_cnt),
-                        )
+                if partial_df is not None and done > 0:
+                    snap = build_sim_settings_snap(
+                        p, total_cnt, cache.last_stats,
+                    )
+                    st.session_state.sim_settings_snap = snap
+                    _paint_sim_panel(
+                        results_slot, partial_df, done, total_cnt,
+                        running=(done < total_cnt),
+                        settings_snap=snap,
+                        show_downloads=False,
+                    )
 
             result_df = sim.run(
                 ticker_map,
@@ -943,22 +1134,43 @@ else:
             progress_bar.progress(1.0, text=f"{total}/{total} 종목")
             status_text.empty()
             st.session_state.sim_result = result_df
+            st.session_state.sim_fingerprint = fp_now
+            stats = cache.last_stats
+            st.session_state.cache_stats = dict(stats)
+            snap = build_sim_settings_snap(p, total, stats)
+            st.session_state.sim_settings_snap = snap
+            if stats["candle_miss"] == 0 and stats["flow_miss"] == 0:
+                st.info(
+                    f"⚡ REST 호출 없이 캐시 사용 "
+                    f"(일봉 {stats['candle_hit']}종목"
+                    + (f" · 수급 {stats['flow_hit']}종목" if stats["flow_hit"] else "")
+                    + ")"
+                )
+            elif stats["candle_hit"] or stats["flow_hit"]:
+                st.caption(
+                    f"데이터: 일봉 캐시 {stats['candle_hit']} / API {stats['candle_miss']}"
+                    + (
+                        f" · 수급 캐시 {stats['flow_hit']} / API {stats['flow_miss']}"
+                        if demand_filter_enabled(p) else ""
+                    )
+                )
+            else:
+                st.caption("데이터: REST API에서 일봉(및 수급)을 수집해 캐시에 저장했습니다. 같은 종목 재실행 시 API를 생략합니다.")
 
-            with sim_panel.container():
-                st.subheader("📊 시뮬레이션 결과")
-                _render_sim_results(result_df, total, total, running=False)
-                if not result_df.empty:
-                    _sim_export_downloads(result_df, key="sim_csv_after_run")
+            _paint_sim_panel(
+                results_slot, result_df, total, total,
+                running=False, settings_snap=snap,
+                show_downloads=True,
+            )
 
         elif st.session_state.sim_result is not None:
-            with sim_panel.container():
-                st.subheader("📊 시뮬레이션 결과")
-                df_sim = st.session_state.sim_result
-                n_done = len(summarize_by_stock(df_sim))
-                n_total = len(st.session_state.ticker_map)
-                _render_sim_results(df_sim, n_done, n_total, running=False)
-                if not df_sim.empty:
-                    _sim_export_downloads(df_sim, key="sim_csv_download")
+            df_sim = st.session_state.sim_result
+            n_done = len(summarize_by_stock(df_sim))
+            n_total = len(st.session_state.ticker_map)
+            _paint_sim_panel(
+                results_slot, df_sim, n_done, n_total,
+                running=False, show_downloads=True,
+            )
 
     # 로그 (시뮬레이션 모드)
     if st.session_state.log_messages:

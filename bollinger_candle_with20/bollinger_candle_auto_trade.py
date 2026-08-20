@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 # ── 페이지 설정 ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="볼린저밴드 자동매매",
+    page_title="볼린저밴드 자동매매 (with20)",
     page_icon="📈",
     layout="wide",
 )
@@ -237,7 +237,7 @@ def _process_ticker(api: KiwoomAPI, sm: StateManager,
         pivot = find_pivot_candle(df, resolve_scan_days(params), params)
         if not pivot:
             return
-        base = check_base_candle(df, pivot)
+        base = check_base_candle(df, pivot, params)
         if not base:
             return
 
@@ -621,6 +621,17 @@ with st.sidebar:
     if p.get("ma_filter_mode") != prev_ma_mode:
         st.session_state.sim_result = None
 
+    # ── 20일선 하락 필터 (기준캔들) ───────────────────────────
+    p["ma20_decline_filter"] = st.checkbox(
+        "20일선 하락반영",
+        value=bool(p.get("ma20_decline_filter", False)),
+        help="체크 시: 기준캔들 당일 SMA20이 전일보다 낮으면 기준캔들로 선정하지 않음",
+    )
+    if p["ma20_decline_filter"]:
+        st.caption("기준캔들: 당일 SMA20 < 전일 SMA20 이면 제외 (같으면 통과)")
+    else:
+        st.caption("기준캔들: 20일선 하락 조건 미적용 (기존과 동일)")
+
     scan_modes = scan_mode_options()
     if p.get("scan_mode") not in scan_modes:
         p["scan_mode"] = scan_modes[0]
@@ -797,7 +808,8 @@ with st.sidebar:
 
 
 # ── 메인 화면 ────────────────────────────────────────────────
-st.title("📈 볼린저밴드 + 저점캔들 돌파 양봉 자동매매")
+st.title("📈 볼린저밴드 + 저점캔들 돌파 양봉 자동매매 (with20)")
+st.caption("기준캔들 선정 시 20일선(SMA20) 하락 필터 옵션 포함")
 
 if missing_env:
     st.error(

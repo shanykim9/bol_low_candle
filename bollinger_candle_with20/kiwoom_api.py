@@ -53,25 +53,6 @@ class RateLimiter:
             self.calls.append(time.time())
 
 
-def _parse_signed_int(value) -> int:
-    """순매수 등 부호 있는 정수 파싱"""
-    if value is None:
-        return 0
-    s = str(value).strip().replace(",", "")
-    if not s or s in ("-", ""):
-        return 0
-    sign = 1
-    if s[0] == "-":
-        sign = -1
-        s = s[1:]
-    elif s[0] == "+":
-        s = s[1:]
-    try:
-        return sign * int(float(s))
-    except ValueError:
-        return 0
-
-
 def _parse_int(value) -> int:
     """키움 API 가격/수량 문자열 파싱 (+/- 부호 제거)"""
     if value is None:
@@ -229,7 +210,6 @@ class KiwoomAPI:
                 resp.raise_for_status()
                 content = resp.content
                 df = None
-                # 바이트→텍스트 디코딩 후 파싱 (encoding kw 미지원 pandas 대응)
                 for enc in ("euc-kr", "cp949", "utf-8"):
                     try:
                         text = content.decode(enc)
@@ -260,45 +240,35 @@ class KiwoomAPI:
         return {}
 
     def _load_name_code_map(self, force: bool = False) -> dict[str, str]:
-        """
-        종목명→코드 맵.
-        빈 맵은 캐시하지 않아 다음 호출에서 재시도한다.
-        """
+        """빈 맵은 캐시하지 않아 다음 호출에서 재시도한다."""
         if not force and self._name_code_map:
             return self._name_code_map
         mapping = self._fetch_krx_listing()
         if mapping:
             self._name_code_map = mapping
         else:
-            # 실패 시 None 유지 → 다음 검색 때 재시도
             self._name_code_map = None
         return mapping
 
     def _search_naver_code(self, name: str) -> Optional[str]:
-        """네이버 증권 자동완성 검색 폴백 (단일 종목명)"""
+        """네이버 증권 자동완성 검색 폴백"""
         try:
-            url = "https://ac.stock.naver.com/ac"
             resp = requests.get(
-                url,
+                "https://ac.stock.naver.com/ac",
                 params={"q": name, "target": "stock"},
                 headers=_HTTP_HEADERS,
                 timeout=10,
             )
             resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items") or []
+            items = resp.json().get("items") or []
             exact = None
             first6 = None
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                # 국내 주식만 (ETF/해외 등 제외 가능하나 이름 일치 시 허용)
                 category = str(item.get("category") or "stock")
-                code_raw = str(item.get("code") or item.get("reutersCode") or "")
-                code = re.sub(r"\D", "", code_raw)
-                if len(code) != 6:
-                    continue
-                if category not in ("stock", ""):
+                code = re.sub(r"\D", "", str(item.get("code") or item.get("reutersCode") or ""))
+                if len(code) != 6 or category not in ("stock", ""):
                     continue
                 title = self._norm_name(item.get("name") or "")
                 if first6 is None:
@@ -320,7 +290,6 @@ class KiwoomAPI:
             return None
         if any(sep in name for sep in (",", ";", "\t", "\n")):
             return None
-        # 6자리 숫자면 종목코드로 간주
         if name.isdigit() and len(name) <= 6:
             return name.zfill(6)
         try:
@@ -330,7 +299,6 @@ class KiwoomAPI:
             for k, v in name_map.items():
                 if name in k or k in name:
                     return v
-            # KRX 목록 실패/미매칭 → 네이버 폴백
             code = self._search_naver_code(name)
             if code:
                 if self._name_code_map is None:
@@ -436,61 +404,6 @@ class KiwoomAPI:
         except Exception as e:
             logger.error("일봉 조회 실패 [%s]: %s", stock_code, e)
             return []
-
-    def get_investor_flow(self, stock_code: str, count: int = 300) -> dict:
-        """
-        종목별 외국인/기관 일별 순매수량 (ka10059).
-        반환: {"foreigner": {YYYYMMDD: int}, "institution": {YYYYMMDD: int}}
-        양수=순매수, 음수=순매도. 수급은 KRX 종목코드 기준.
-        """
-        empty = {"foreigner": {}, "institution": {}}
-        try:
-            code = re.sub(r"_AL$|_NX$", "", str(stock_code).strip())
-            today = datetime.now().strftime("%Y%m%d")
-            body = {
-                "dt"         : today,
-                "stk_cd"     : code,
-                "amt_qty_tp" : "2",   # 수량
-                "trde_tp"    : "0",   # 순매수
-                "unit_tp"    : "1",   # 단주
-            }
-            all_items: list[dict] = []
-            cont_yn  = ""
-            next_key = ""
-            while len(all_items) < count:
-                data, headers = self._api_post_with_headers(
-                    self.tr_ids["investor"],
-                    self.endpoints["investor"],
-                    body,
-                    cont_yn=cont_yn,
-                    next_key=next_key,
-                )
-                batch = data.get("stk_invsr_orgn") or []
-                if not batch:
-                    break
-                all_items.extend(batch)
-                cont = (headers.get("cont-yn") or headers.get("Cont-Yn") or "").upper()
-                if cont != "Y":
-                    break
-                cont_yn  = "Y"
-                next_key = headers.get("next-key") or headers.get("Next-Key") or ""
-
-            foreigner: dict[str, int] = {}
-            institution: dict[str, int] = {}
-            for item in all_items[:count]:
-                dt = re.sub(r"\D", "", str(item.get("dt", "")))[:8]
-                if len(dt) != 8:
-                    continue
-                foreigner[dt] = _parse_signed_int(item.get("frgnr_invsr"))
-                institution[dt] = _parse_signed_int(item.get("orgn"))
-            logger.info(
-                "수급 조회 [%s] 외국인 %d일 / 기관 %d일",
-                code, len(foreigner), len(institution),
-            )
-            return {"foreigner": foreigner, "institution": institution}
-        except Exception as e:
-            logger.error("수급 조회 실패 [%s]: %s", stock_code, e)
-            return empty
 
     # ── 주문 ──────────────────────────────────────────────────
     def place_order(self, stock_code: str, order_type: str,

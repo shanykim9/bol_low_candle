@@ -9,10 +9,13 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 
 # 코드 업데이트 시 Streamlit 세션 초기화용 (값 변경 시 자동 리셋)
-APP_VERSION = "20260726-v14"
+APP_VERSION = "20260726-with20-v2"
 
-# .env 파일 로딩
-load_dotenv()
+# .env 파일 로딩 (서브폴더 → 상위 저장소 순)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+load_dotenv(os.path.join(_HERE, ".env"))
+load_dotenv(os.path.join(_ROOT, ".env"))
 
 # ── API 인증정보 ──────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "").strip()
@@ -31,7 +34,6 @@ ENDPOINTS = {
     "cancel"     : "/api/dostk/ordr",        # 취소주문 (같은 경로)
     "balance"    : "/api/dostk/acnt",        # 계좌/잔고
     "stock_info" : "/api/dostk/stkinfo",     # 종목정보
-    "investor"   : "/api/dostk/stkinfo",     # 종목별 투자자(외인/기관) 수급
 }
 
 TR_IDS = {
@@ -43,7 +45,6 @@ TR_IDS = {
     "balance"  : "kt00005",   # 체결잔고요청
     "unfilled" : "ka10075",   # 미체결요청
     "stock_info": "ka10001",  # 주식기본정보요청
-    "investor" : "ka10059",   # 종목별투자자기관별요청
 }
 
 # ── 시세 구분 (KRX / 통합시세) ─────────────────────────────────
@@ -91,8 +92,7 @@ DEFAULT_PARAMS = {
     "price_source"     : "KRX",       # 시세 구분: KRX | 통합
     "ma_filter_mode"   : "디폴트",     # 240일선 조건: 디폴트 | 240선추세
     "ma_trend_days"    : 3,           # 240선추세 모드 시 연속 상승 일수 (3/7/10/20)
-    "foreigner_days"   : 0,           # 외국인 연속 순매수 일수 (0=미사용, 1~3)
-    "institution_days" : 0,           # 기관 연속 순매수 일수 (0=미사용, 1~3)
+    "ma20_decline_filter": False,     # 기준캔들: 20일선 전일 대비 하락 시 제외 (기본 OFF)
 }
 
 # ── 장 운영시간 ───────────────────────────────────────────────
@@ -279,8 +279,12 @@ def format_ma_filter(params: dict) -> str:
     """UI/로그용 240일선 조건 설명"""
     if params.get("ma_filter_mode") == "240선추세":
         days = int(params.get("ma_trend_days", 3))
-        return f"240선 {days}일 연속 상승"
-    return "240선 위 (디폴트)"
+        base = f"240선 {days}일 연속 상승"
+    else:
+        base = "240선 위 (디폴트)"
+    if params.get("ma20_decline_filter", False):
+        return f"{base} · 20일선 하락 제외"
+    return base
 
 
 def parse_stock_list(text: str) -> list[str]:

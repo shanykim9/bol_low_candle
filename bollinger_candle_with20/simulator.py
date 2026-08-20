@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from kiwoom_api import KiwoomAPI
-from strategy import simulate_strategy, demand_filter_enabled
+from strategy import simulate_strategy
 from config import resolve_data_days, SETTLEMENT_TRADING_DAYS
 
 logger = logging.getLogger(__name__)
@@ -19,101 +19,10 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, str, Optional[pd.DataFrame]], None]
 
 
-class MarketDataCache:
-    """
-    종목별 일봉·수급을 세션 dict에 보관 (클래스 인스턴스 대신 순수 dict).
-    같은 종목·시세에서 이미 받아 둔 일수면 REST를 다시 치지 않는다.
-    """
-
-    def __init__(self, store: Optional[dict] = None):
-        self.store = store if isinstance(store, dict) else {}
-        self.store.setdefault("candles", {})
-        self.store.setdefault("investor", {})
-        self.last_stats = {"candle_hit": 0, "candle_miss": 0, "flow_hit": 0, "flow_miss": 0}
-
-    def reset_stats(self):
-        self.last_stats = {"candle_hit": 0, "candle_miss": 0, "flow_hit": 0, "flow_miss": 0}
-
-    @staticmethod
-    def _candle_key(code: str, price_source: str) -> str:
-        return f"{code}|{price_source or 'KRX'}"
-
-    def _candle_enough(self, key: str, count: int) -> bool:
-        cached = self.store["candles"].get(key) or {}
-        rows = cached.get("rows") or []
-        requested = int(cached.get("requested") or 0)
-        return bool(rows) and (requested >= count or len(rows) >= count)
-
-    def _flow_enough(self, code: str, count: int) -> bool:
-        cached = self.store["investor"].get(str(code)) or {}
-        requested = int(cached.get("requested") or 0)
-        n = len(cached.get("foreigner") or {})
-        return requested >= count or n >= count
-
-    def covers(self, ticker_map: dict, candle_count: int, price_source: str,
-               flow_count: int = 0) -> bool:
-        src = str(price_source or "KRX")
-        for code in ticker_map:
-            if not self._candle_enough(self._candle_key(code, src), candle_count):
-                return False
-            if flow_count > 0 and not self._flow_enough(code, flow_count):
-                return False
-        return True
-
-    def get_candles(self, api: Optional[KiwoomAPI], code: str, count: int,
-                    price_source: str) -> list[dict]:
-        count = int(count)
-        key = self._candle_key(code, price_source)
-        if self._candle_enough(key, count):
-            self.last_stats["candle_hit"] += 1
-            logger.info("일봉 캐시 사용 [%s] %s %d일", code, price_source, count)
-            rows = self.store["candles"][key]["rows"]
-            return list(rows[:count])
-
-        if api is None:
-            raise RuntimeError("일봉 캐시 없음 — API가 필요합니다")
-        self.last_stats["candle_miss"] += 1
-        logger.info("일봉 REST 조회 [%s] %s %d일", code, price_source, count)
-        rows = api.get_daily_candles(code, count=count, price_source=price_source) or []
-        # 빈 응답은 캐시하지 않음 (인증실패·일시오류 시 다음 실행에서 재시도)
-        if rows:
-            self.store["candles"][key] = {"rows": rows, "requested": count}
-        return list(rows[:count]) if rows else []
-
-    def get_investor_flow(self, api: Optional[KiwoomAPI], code: str, count: int) -> dict:
-        count = int(count)
-        cached = self.store["investor"].get(str(code))
-        if cached and self._flow_enough(code, count):
-            self.last_stats["flow_hit"] += 1
-            logger.info("수급 캐시 사용 [%s] %d일", code, count)
-            return {
-                "foreigner": dict(cached.get("foreigner") or {}),
-                "institution": dict(cached.get("institution") or {}),
-            }
-
-        if api is None:
-            raise RuntimeError("수급 캐시 없음 — API가 필요합니다")
-        self.last_stats["flow_miss"] += 1
-        logger.info("수급 REST 조회 [%s] %d일", code, count)
-        data = api.get_investor_flow(code, count=count) or {}
-        packed = {
-            "foreigner": data.get("foreigner") or {},
-            "institution": data.get("institution") or {},
-            "requested": count if (data.get("foreigner") or data.get("institution")) else 0,
-        }
-        self.store["investor"][str(code)] = packed
-        return {
-            "foreigner": dict(packed["foreigner"]),
-            "institution": dict(packed["institution"]),
-        }
-
-
 class Simulator:
-    def __init__(self, api: Optional[KiwoomAPI], params: dict,
-                 data_cache: Optional[MarketDataCache] = None):
-        self.api        = api
-        self.params     = params
-        self.data_cache = data_cache
+    def __init__(self, api: KiwoomAPI, params: dict):
+        self.api    = api
+        self.params = params
 
     def run(self, ticker_map: dict[str, str],
             progress_callback: Optional[ProgressCallback] = None) -> pd.DataFrame:
@@ -152,40 +61,15 @@ class Simulator:
     def _simulate_one(self, code: str, name: str) -> list[dict]:
         """단일 종목 시뮬 → 레코드 리스트 (0건이면 빈 레코드 1행)"""
         try:
-            needed = resolve_data_days(self.params)
-            src = self.params.get("price_source", "KRX")
-            flow_n = max(needed + 20, 120)
-            need_flow = demand_filter_enabled(self.params)
-            if self.data_cache is not None:
-                candles = self.data_cache.get_candles(self.api, code, needed, src)
-                investor_flow = (
-                    self.data_cache.get_investor_flow(self.api, code, flow_n)
-                    if need_flow else None
-                )
-            else:
-                candles = self.api.get_daily_candles(
-                    code, count=needed, price_source=src,
-                ) if self.api else []
-                investor_flow = None
-                if need_flow and self.api:
-                    investor_flow = self.api.get_investor_flow(code, count=flow_n)
+            candles = self.api.get_daily_candles(
+                code, count=resolve_data_days(self.params),
+                price_source=self.params.get("price_source", "KRX"),
+            )
             if not candles:
                 logger.warning("일봉 데이터 없음: %s", code)
-                return [_empty_record(code, name, "데이터 없음(일봉조회실패)")]
+                return [_empty_record(code, name, "데이터 없음")]
 
-            if need_flow and (
-                not investor_flow
-                or (
-                    not investor_flow.get("foreigner")
-                    and not investor_flow.get("institution")
-                )
-            ):
-                logger.warning("수급 데이터 없음: %s", code)
-                return [_empty_record(code, name, "수급데이터 없음")]
-            if not need_flow:
-                investor_flow = None
-
-            trades = simulate_strategy(candles, self.params, investor_flow)
+            trades = simulate_strategy(candles, self.params)
             if not trades:
                 return [_empty_record(code, name, "매매조건 없음")]
 
